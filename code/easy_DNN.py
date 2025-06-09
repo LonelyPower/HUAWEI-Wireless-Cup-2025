@@ -5,7 +5,42 @@ import copy
 TRAIN_FILE = "../datasets/AI-dataset/data_train.jsonl"
 TEST_FILE = "../datasets/AI-dataset/data_test.jsonl"
 OUTPUT_FILE = "results1.jsonl"
+def compute_feature_importances_decision_stump(X, y, n_thresholds=10):
+    """
+    Compute feature importances via 1-level decision stumps.
+    X: (N, D) feature matrix
+    y: (N, 1) target values
+    n_thresholds: number of candidate split points per feature
+    Returns importances: (D,) array of MSE reduction achieved by best stump on each feature
+    """
+    N, D = X.shape
+    y = y.reshape(-1, 1)
+    parent_var = np.mean((y - y.mean())**2)
+    importances = np.zeros(D, dtype=np.float32)
 
+    # candidate quantiles at evenly spaced percentages (exclude 0 and 100)
+    qs = np.linspace(0, 100, n_thresholds+2)[1:-1]
+
+    for j in range(D):
+        xj = X[:, j]
+        thresholds = np.percentile(xj, qs)
+        best_imp = 0.0
+        for t in thresholds:
+            left_mask = xj <= t
+            right_mask = ~left_mask
+            n_l = left_mask.sum()
+            n_r = N - n_l
+            if n_l == 0 or n_r == 0:
+                continue
+            y_l = y[left_mask]
+            y_r = y[right_mask]
+            mse_l = np.mean((y_l - y_l.mean())**2)
+            mse_r = np.mean((y_r - y_r.mean())**2)
+            imp = parent_var - (n_l/N)*mse_l - (n_r/N)*mse_r
+            if imp > best_imp:
+                best_imp = imp
+        importances[j] = best_imp
+    return importances
 # ========== 数据加载（保留原始三采样） ==========
 def load_train_data(path):
     X_avg_list, y_avg_list = [], []

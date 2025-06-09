@@ -1,3 +1,4 @@
+# data_and_preprocess.py
 import numpy as np
 import json
 
@@ -54,3 +55,37 @@ def robust_scaler_fit(X):
 
 def robust_scaler_transform(X, median, iqr):
     return (X - median) / iqr
+
+def compute_feature_importances_decision_stump(X, y, n_thresholds=10):
+    """
+    对每个特征，枚举 n_thresholds 个分割点，计算分割前后 MSE 减少量，作为特征重要性。
+    X: (m, D), y: (m,)
+    返回 importances: (D,)
+    """
+    m, D = X.shape
+    importances = np.zeros(D, dtype=np.float32)
+    parent_var = np.mean((y - y.mean())**2)
+
+    # 对每个特征
+    for j in range(D):
+        xs = X[:, j]
+        # 生成阈值：该特征的分位数，排除最小值和最大值
+        qs = np.linspace(0, 100, n_thresholds+2)[1:-1]
+        thresholds = np.percentile(xs, qs)
+        best_gain = 0.0
+        # 枚举阈值
+        for t in thresholds:
+            left_mask = xs <= t
+            right_mask = xs > t
+            if left_mask.sum() < 2 or right_mask.sum() < 2:
+                continue
+            y_l, y_r = y[left_mask], y[right_mask]
+            mse_l = np.mean((y_l - y_l.mean())**2)
+            mse_r = np.mean((y_r - y_r.mean())**2)
+            # 加权 MSE
+            wmse = (left_mask.sum()*mse_l + right_mask.sum()*mse_r) / m
+            gain = parent_var - wmse
+            if gain > best_gain:
+                best_gain = gain
+        importances[j] = best_gain
+    return importances
