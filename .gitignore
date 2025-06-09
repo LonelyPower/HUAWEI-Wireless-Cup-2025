@@ -2,3 +2,4 @@
 /datasets/AI-dataset
 /.vscode
 final/final.zip
+*.pyc
