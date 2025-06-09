@@ -1,5 +1,6 @@
 import numpy as np
 import json
+import copy
 
 TRAIN_FILE = "../datasets/AI-dataset/data_train.jsonl"
 TEST_FILE = "../datasets/AI-dataset/data_test.jsonl"
@@ -7,11 +8,8 @@ OUTPUT_FILE = "results1.jsonl"
 
 # ========== 数据加载（保留原始三采样） ==========
 def load_train_data(path):
-    X_avg_list = []
-    y_avg_list = []
-    X_raw_list = []
-    y_raw_list = []
-
+    X_avg_list, y_avg_list = [], []
+    X_raw_list, y_raw_list = [], []
     with open(path, 'r') as f:
         for line in f:
             try:
@@ -24,12 +22,11 @@ def load_train_data(path):
                 y_avg_list.append(np.mean(lbls))
             except (KeyError, json.JSONDecodeError) as e:
                 print(f"数据解析错误: {e}，跳过该行")
-
     return (
-        np.stack(X_avg_list),
-        np.array(y_avg_list),
-        np.stack(X_raw_list),
-        np.stack(y_raw_list)
+        np.stack(X_avg_list),          # (N, D)
+        np.array(y_avg_list),          # (N,)
+        np.stack(X_raw_list),          # (N, 3, D)
+        np.stack(y_raw_list)           # (N, 3)
     )
 
 # ========== 读取测试集 ==========
@@ -54,41 +51,9 @@ def init_layers(layer_sizes, seed=42):
     params = []
     for i in range(len(layer_sizes) - 1):
         W = np.random.randn(layer_sizes[i], layer_sizes[i+1]) * np.sqrt(2. / layer_sizes[i])
-        b = np.zeros((1, layer_sizes[i+1]))
+        b = np.zeros((1, layer_sizes[i+1]), dtype=np.float32)
         params.append((W, b))
     return params
-
-# ========== 前向传播 ==========
-def forward(X, params):
-    A = X
-    caches = []
-    for idx, (W, b) in enumerate(params):
-        Z = A @ W + b
-        caches.append((A, Z, W, b))
-        A = relu(Z) if idx < len(params) - 1 else Z
-    return A, caches
-
-# ========== 反向传播 ==========
-def backward(y_pred, y_true, caches, weights, clip_value=5.0):
-    m = y_true.shape[0]
-    y_true = y_true.reshape(y_pred.shape)
-    dZ = (y_pred - y_true) * weights.reshape(-1, 1) / m
-    grads = []
-
-    for i in reversed(range(len(caches))):
-        A_prev, Z, W, b = caches[i]
-        dW = np.clip(A_prev.T @ dZ, -clip_value, clip_value)
-        db = np.clip(np.sum(dZ, axis=0, keepdims=True), -clip_value, clip_value)
-        grads.insert(0, (dW, db))
-        if i > 0:
-            dA_prev = dZ @ W.T
-            _, Z_prev, _, _ = caches[i - 1]
-            dZ = dA_prev * relu_derivative(Z_prev)
-    return grads
-
-# ========== 参数更新 ==========
-def update(params, grads, lr):
-    return [(W - lr * dW, b - lr * db) for (W, b), (dW, db) in zip(params, grads)]
 
 # ========== 特征标准化 + 维度选择 ==========
 def normalize_features(X):
@@ -115,23 +80,146 @@ def compute_weights_from_raw(X_raw, y_raw, std_thresh=1.0, delta_thresh=2e7):
             weights[i] = 0.6
         else:
             weights[i] = 1.0
-    return weights
+    return weights  # shape (N,)
 
-# ========== 模型训练 ==========
-def train(X, y, X_raw, y_raw, layers, epochs=200, lr=1e-4, clip_value=5.0):
+# ========== 前向传播 ==========
+def forward(X, params):
+    A = X
+    caches = []
+    for idx, (W, b) in enumerate(params):
+        Z = A @ W + b
+        caches.append((A, Z, W, b))
+        A = relu(Z) if idx < len(params) - 1 else Z
+    return A, caches
+
+# ========== 反向传播 ==========
+def backward(y_pred, y_true, caches, weights=None, clip_value=5.0):
+    m = y_true.shape[0]
+    y_true = y_true.reshape(y_pred.shape)
+    if weights is None:
+        weights = np.ones((m,), dtype=np.float32)
+    dZ = (y_pred - y_true) * weights.reshape(-1, 1) / m
+    grads = []
+    for i in reversed(range(len(caches))):
+        A_prev, Z, W, b = caches[i]
+        dW = np.clip(A_prev.T @ dZ, -clip_value, clip_value)
+        db = np.clip(np.sum(dZ, axis=0, keepdims=True), -clip_value, clip_value)
+        grads.insert(0, (dW, db))
+        if i > 0:
+            dA_prev = dZ @ W.T
+            _, Z_prev, _, _ = caches[i - 1]
+            dZ = dA_prev * relu_derivative(Z_prev)
+    return grads
+
+# ========== 生成 Mini-batches ==========
+def get_batches(X, y, weights, batch_size, shuffle=True):
+    m = X.shape[0]
+    idxs = np.arange(m)
+    if shuffle:
+        np.random.shuffle(idxs)
+    for start in range(0, m, batch_size):
+        end = start + batch_size
+        batch_idx = idxs[start:end]
+        yield X[batch_idx], y[batch_idx], weights[batch_idx]
+
+# ========== 模型训练（含 Mini-batch, Adam, 学习率调度, 早停） ==========
+def train(
+    X, y, X_raw, y_raw,
+    layers,
+    epochs=200,
+    initial_lr=1e-4,
+    batch_size=64,
+    val_ratio=0.1,
+    beta1=0.9,
+    beta2=0.999,
+    eps=1e-8,
+    lr_decay=0.5,
+    decay_step=50,
+    patience=10,
+    clip_value=5.0,
+    seed=42
+):
+    # 1. 预处理
     X_norm, mean, std, mask = normalize_features(X)
-    params = init_layers([X_norm.shape[1]] + layers[1:])
     y = y.reshape(-1, 1)
-    weights = compute_weights_from_raw(X_raw, y_raw)
+    weights_all = compute_weights_from_raw(X_raw, y_raw)
+    # 2. 划分训练/验证集
+    np.random.seed(seed)
+    m = X_norm.shape[0]
+    idxs = np.arange(m)
+    np.random.shuffle(idxs)
+    val_size = int(m * val_ratio)
+    val_idx, train_idx = idxs[:val_size], idxs[val_size:]
+    X_val, y_val, w_val = X_norm[val_idx], y[val_idx], weights_all[val_idx]
+    X_train, y_train, w_train = X_norm[train_idx], y[train_idx], weights_all[train_idx]
+    # 3. 参数与 Adam 状态初始化
+    params = init_layers([X_norm.shape[1]] + layers[1:], seed)
+    mW = [np.zeros_like(W) for W, _ in params]
+    vW = [np.zeros_like(W) for W, _ in params]
+    mB = [np.zeros_like(b) for _, b in params]
+    vB = [np.zeros_like(b) for _, b in params]
+    best_params = copy.deepcopy(params)
+    best_val_loss = float('inf')
+    wait = 0
+    lr = initial_lr
+    iter_count = 0
 
+    # 4. 训练主循环
     for epoch in range(1, epochs + 1):
-        y_pred, caches = forward(X_norm, params)
-        loss = 0.5 * np.mean(weights.reshape(-1, 1) * ((y_pred - y) ** 2))
-        grads = backward(y_pred, y, caches, weights, clip_value)
-        params = update(params, grads, lr)
-        if epoch % 10 == 0:
-            print(f"[Epoch {epoch}] loss = {loss:.6e}, y_pred std = {y_pred.std():.6f}")
-    return params, mean, std, mask
+        # Mini-batch 训练
+        train_loss = 0.0
+        n_batches = 0
+        for X_b, y_b, w_b in get_batches(X_train, y_train, w_train, batch_size, shuffle=True):
+            iter_count += 1
+            # 前向
+            y_pred, caches = forward(X_b, params)
+            # 损失累加
+            train_loss += 0.5 * np.mean(w_b.reshape(-1,1) * ((y_pred - y_b)**2)) * X_b.shape[0]
+            n_batches += X_b.shape[0]
+            # 反向 & 梯度
+            grads = backward(y_pred, y_b, caches, w_b, clip_value)
+            # Adam 更新
+            for i, ((W, b), (dW, db)) in enumerate(zip(params, grads)):
+                mW[i] = beta1 * mW[i] + (1 - beta1) * dW
+                vW[i] = beta2 * vW[i] + (1 - beta2) * (dW ** 2)
+                mB[i] = beta1 * mB[i] + (1 - beta1) * db
+                vB[i] = beta2 * vB[i] + (1 - beta2) * (db ** 2)
+
+                # 偏差校正
+                mW_corr = mW[i] / (1 - beta1**iter_count)
+                vW_corr = vW[i] / (1 - beta2**iter_count)
+                mB_corr = mB[i] / (1 - beta1**iter_count)
+                vB_corr = vB[i] / (1 - beta2**iter_count)
+
+                # 参数更新
+                W -= lr * mW_corr / (np.sqrt(vW_corr) + eps)
+                b -= lr * mB_corr / (np.sqrt(vB_corr) + eps)
+                params[i] = (W, b)
+
+        train_loss /= n_batches
+
+        # 验证集损失
+        y_val_pred, _ = forward(X_val, params)
+        val_loss = 0.5 * np.mean(w_val.reshape(-1,1) * ((y_val_pred - y_val)**2))
+
+        print(f"[Epoch {epoch}] train_loss={train_loss:.6e}  val_loss={val_loss:.6e}  lr={lr:.2e}")
+
+        # 早停 & 学习率调度
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_params = copy.deepcopy(params)
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"Early stopping at epoch {epoch}. Best val_loss={best_val_loss:.6e}")
+                break
+
+        if epoch % decay_step == 0:
+            lr *= lr_decay
+            print(f"  --> learning rate decayed to {lr:.2e}")
+
+    return best_params, mean, std, mask
 
 # ========== 模型预测 ==========
 def predict(X, params, mean, std, mask):
@@ -148,12 +236,31 @@ def save_results(preds, path):
 
 # ========== 主程序入口 ==========
 if __name__ == "__main__":
+    # 加载数据
     X_avg, y_avg, X_raw, y_raw = load_train_data(TRAIN_FILE)
     X_test = load_test_data(TEST_FILE)
     print(f"训练数据: X.shape={X_avg.shape}, y.shape={y_avg.shape}")
 
+    # 网络结构和超参
     layers = [X_avg.shape[1], 256, 128, 1]
-    params, mean, std, mask = train(X_avg, y_avg, X_raw, y_raw, layers)
+    params, mean, std, mask = train(
+        X_avg, y_avg, X_raw, y_raw,
+        layers,
+        epochs=200,
+        initial_lr=1e-4,
+        batch_size=64,
+        val_ratio=0.1,
+        beta1=0.9,
+        beta2=0.999,
+        eps=1e-8,
+        lr_decay=0.5,
+        decay_step=50,
+        patience=10,
+        clip_value=5.0,
+        seed=42
+    )
+
+    # 预测并保存
     preds = predict(X_test, params, mean, std, mask)
     save_results(preds, OUTPUT_FILE)
     print(f"预测结果已保存至 {OUTPUT_FILE}")
