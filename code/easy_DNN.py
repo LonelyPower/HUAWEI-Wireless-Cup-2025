@@ -5,6 +5,32 @@ import copy
 TRAIN_FILE = "../datasets/AI-dataset/data_train.jsonl"
 TEST_FILE = "../datasets/AI-dataset/data_test.jsonl"
 OUTPUT_FILE = "results1.jsonl"
+def pca_fit(X, variance_ratio=0.95):
+    """
+    在 X（N×D）的基础上做 PCA，找出能覆盖 variance_ratio 方差的前 k 个主成分
+    返回 X 的均值和 principal components（k×D）
+    """
+    # 1. 均值中心化
+    mean = X.mean(axis=0, keepdims=True)               # (1, D)
+    Xc = X - mean                                      # (N, D)
+    # 2. SVD 分解
+    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)  # Vt: (D, D)
+    # 3. 方差贡献率
+    var = S**2
+    cumvar = np.cumsum(var) / np.sum(var)
+    k = np.searchsorted(cumvar, variance_ratio) + 1
+    # 4. 取前 k 个主成分
+    components = Vt[:k]                                # (k, D)
+    return mean, components
+
+def pca_transform(X, mean, components):
+    """
+    对新数据 X 做同样的中心化 + 投影
+    返回降维后 X_pca (N, k)
+    """
+    Xc = X - mean                                       # (N, D)
+    return Xc @ components.T                           # (N, k)
+
 
 # ========== 数据加载（保留原始三采样） ==========
 def load_train_data(path):
@@ -127,8 +153,7 @@ def robust_scaler_transform(X, median, iqr):
 
 # ========== 训练主函数 ==========
 def train(
-    X_avg, y_avg, X_raw, y_raw,
-    layers,
+    X_avg, y_avg, X_raw, y_raw, layers,
     epochs=200,
     initial_lr=1e-4,
     batch_size=64,
@@ -140,96 +165,115 @@ def train(
     decay_step=50,
     patience=10,
     clip_value=5.0,
-    seed=42
+    seed=42,
+    variance_ratio=0.95
 ):
-    # 1. 删除稀疏特征
-    sparse_mask = compute_sparse_mask(X_avg, thresh=0.05)
-    X_sel = X_avg[:, sparse_mask]            # (N, D')
-    X_raw_sel = X_raw[:, :, sparse_mask]     # (N, 3, D')
-    # 2. 数值压缩：log1p
-    X_log = np.log1p(X_sel)
-    # 3. RobustScaler 标准化
-    median, iqr = robust_scaler_fit(X_log)
-    X_norm = robust_scaler_transform(X_log, median, iqr)
+    # 1. 删除极度稀疏特征（非零比例 < 5%）
+    nonzero_ratio = (X_avg != 0).mean(axis=0)
+    sparse_mask = nonzero_ratio > 0.05            # (D,)
+    X_sel = X_avg[:, sparse_mask]                  # (N, D')
+    X_raw_sel = X_raw[:, :, sparse_mask]           # (N, 3, D')
 
-    # 4. 标签与权重
-    y = y_avg.reshape(-1,1)
-    weights_all = compute_weights_from_raw(X_raw_sel, y_raw)
+    # 2. log1p 数值压缩
+    X_log = np.log1p(X_sel)                        # (N, D')
 
-    # 5. 划分训练/验证集
+    # 3. RobustScaler：中位数 + IQR
+    median = np.median(X_log, axis=0, keepdims=True)     # (1, D')
+    q1 = np.percentile(X_log, 25, axis=0, keepdims=True)
+    q3 = np.percentile(X_log, 75, axis=0, keepdims=True)
+    iqr = q3 - q1
+    iqr[iqr < 1e-2] = 1.0
+    X_norm = (X_log - median) / iqr              # (N, D')
+
+    # 4. PCA 降维
+    pca_mean, pca_components = pca_fit(X_norm, variance_ratio)
+    X_pca = pca_transform(X_norm, pca_mean, pca_components)  # (N, k)
+    X_input = X_pca
+
+    # 5. 构造标签与权重
+    y = y_avg.reshape(-1, 1)                     # (N, 1)
+    # 这里假定 compute_weights_from_raw 已定义
+    weights_all = compute_weights_from_raw(X_raw_sel, y_raw)  # (N,)
+
+    # 6. 划分训练/验证集
     np.random.seed(seed)
-    m = X_norm.shape[0]
+    m = X_input.shape[0]
     idxs = np.arange(m)
     np.random.shuffle(idxs)
     val_size = int(m * val_ratio)
     val_idx, train_idx = idxs[:val_size], idxs[val_size:]
-    X_val, y_val, w_val = X_norm[val_idx], y[val_idx], weights_all[val_idx]
-    X_tr, y_tr, w_tr = X_norm[train_idx], y[train_idx], weights_all[train_idx]
+    X_val, y_val, w_val = X_input[val_idx], y[val_idx], weights_all[val_idx]
+    X_tr,  y_tr,  w_tr  = X_input[train_idx], y[train_idx], weights_all[train_idx]
 
-    # 6. 初始化网络 & Adam 状态
-    params = init_layers([X_norm.shape[1]] + layers[1:], seed)
+    # 7. 初始化网络 & Adam 状态
+    params = init_layers([X_input.shape[1]] + layers[1:], seed)
     mW = [np.zeros_like(W) for W,_ in params]
     vW = [np.zeros_like(W) for W,_ in params]
     mB = [np.zeros_like(b) for _,b in params]
     vB = [np.zeros_like(b) for _,b in params]
-    best_params = copy.deepcopy(params)
-    best_val = float('inf')
-    wait = 0
-    lr = initial_lr
-    iters = 0
 
-    # 7. 训练循环
+    best_params, best_val = None, float('inf')
+    wait, lr, iters = 0, initial_lr, 0
+
+    # 8. 训练循环
     for epoch in range(1, epochs+1):
-        train_loss = 0.0
-        tot = 0
-        for Xb, yb, wb in get_batches(X_tr, y_tr, w_tr, batch_size):
+        train_loss, total = 0.0, 0
+        for Xb, yb, wb in get_batches(X_tr, y_tr, w_tr, batch_size, shuffle=True):
             iters += 1
+            # forward
             y_pred, caches = forward(Xb, params)
             train_loss += 0.5 * np.mean(wb.reshape(-1,1)*(y_pred-yb)**2) * Xb.shape[0]
-            tot += Xb.shape[0]
+            total += Xb.shape[0]
+            # backward
             grads = backward(y_pred, yb, caches, wb, clip_value)
+            # Adam update
             for i, ((W,b),(dW,db)) in enumerate(zip(params, grads)):
                 mW[i] = beta1*mW[i] + (1-beta1)*dW
                 vW[i] = beta2*vW[i] + (1-beta2)*(dW**2)
                 mB[i] = beta1*mB[i] + (1-beta1)*db
                 vB[i] = beta2*vB[i] + (1-beta2)*(db**2)
-                mW_corr = mW[i]/(1-beta1**iters)
-                vW_corr = vW[i]/(1-beta2**iters)
-                mB_corr = mB[i]/(1-beta1**iters)
-                vB_corr = vB[i]/(1-beta2**iters)
-                W -= lr * mW_corr/(np.sqrt(vW_corr)+eps)
-                b -= lr * mB_corr/(np.sqrt(vB_corr)+eps)
+
+                mW_corr = mW[i] / (1 - beta1**iters)
+                vW_corr = vW[i] / (1 - beta2**iters)
+                mB_corr = mB[i] / (1 - beta1**iters)
+                vB_corr = vB[i] / (1 - beta2**iters)
+
+                W -= lr * mW_corr / (np.sqrt(vW_corr) + eps)
+                b -= lr * mB_corr / (np.sqrt(vB_corr) + eps)
                 params[i] = (W, b)
-        train_loss /= tot
+
+        train_loss /= total
 
         # 验证集
         yv_pred, _ = forward(X_val, params)
-        val_loss = 0.5 * np.mean(w_val.reshape(-1,1)*(yv_pred - y_val)**2)
-        print(f"[{epoch}] train={train_loss:.6e}  val={val_loss:.6e}  lr={lr:.2e}")
+        val_loss = 0.5 * np.mean(w_val.reshape(-1,1)*(yv_pred-y_val)**2)
 
-        # 早停 & 调度
+        print(f"[Epoch {epoch}] train={train_loss:.6e}  val={val_loss:.6e}  lr={lr:.2e}")
+
+        # 早停 & lr 调度
         if val_loss < best_val:
-            best_val, best_params = val_loss, copy.deepcopy(params)
-            wait = 0
+            best_val, best_params, wait = val_loss, copy.deepcopy(params), 0
         else:
             wait += 1
             if wait >= patience:
                 print(f"Early stopping at epoch {epoch}, best_val={best_val:.6e}")
                 break
+
         if epoch % decay_step == 0:
             lr *= lr_decay
-            print(f" lr decayed to {lr:.2e}")
+            print(f"  -> lr decayed to {lr:.2e}")
 
-    # 返回训练后参数及预处理所需量
-    return best_params, median, iqr, sparse_mask
-
+    return best_params, median, iqr, sparse_mask, pca_mean, pca_components
 # ========== 预测函数 ==========
-def predict(X, params, median, iqr, sparse_mask):
+def predict(X, params, median, iqr, sparse_mask, pca_mean, pca_components):
     # 同样的预处理
     X_sel = X[:, sparse_mask]
     X_log = np.log1p(X_sel)
     X_norm = robust_scaler_transform(X_log, median, iqr)
-    y_pred, _ = forward(X_norm, params)
+    X_pca = pca_transform(X_norm, pca_mean, pca_components)
+    # 3. 前向
+    y_pred, _ = forward(X_pca, params)
+    # y_pred, _ = forward(X_norm, params)
     return y_pred.squeeze()
 
 # ========== 保存结果 ==========
@@ -245,12 +289,12 @@ if __name__ == "__main__":
     print(f"训练集: X_avg.shape={X_avg.shape}, y_avg.shape={y_avg.shape}")
 
     layers = [X_avg.shape[1], 256, 128, 1]
-    params, median, iqr, sparse_mask = train(
+    params, median, iqr, sparse_mask , pca_mean, pca_components= train(
         X_avg, y_avg, X_raw, y_raw, layers,
         epochs=200, initial_lr=1e-4, batch_size=64,
         val_ratio=0.1, lr_decay=0.5, decay_step=50, patience=10
     )
 
-    preds = predict(X_test, params, median, iqr, sparse_mask)
+    preds = predict(X_test, params, median, iqr, sparse_mask, pca_mean, pca_components)
     save_results(preds, OUTPUT_FILE)
     print(f"预测结果已保存至 {OUTPUT_FILE}")
