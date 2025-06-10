@@ -1,91 +1,86 @@
 # data_and_preprocess.py
 import numpy as np
-import json
+import pandas as pd
+from pathlib import Path
+from sklearn.preprocessing import RobustScaler
+from sklearn.feature_selection import VarianceThreshold
+
+# 自动定位到项目根目录下的 datasets/AI-dataset
+# BASE_DIR = Path(__file__).resolve().parent.parent
 
 def load_train_data(path):
-    X_avg_list, y_avg_list = [], []
-    X_raw_list, y_raw_list = [], []
-    with open(path, 'r') as f:
-        for line in f:
-            try:
-                item = json.loads(line)
-                ftrs = np.array(item['Features'], dtype=np.float32)  # (3, D)
-                lbls = np.array(item['Labels'], dtype=np.float32)    # (3,)
-                X_raw_list.append(ftrs)
-                y_raw_list.append(lbls)
-                X_avg_list.append(np.mean(ftrs, axis=0))  # (D,)
-                y_avg_list.append(np.mean(lbls))
-            except (KeyError, json.JSONDecodeError) as e:
-                print(f"数据解析错误: {e}，跳过该行")
-    return (
-        np.stack(X_avg_list), np.array(y_avg_list),
-        np.stack(X_raw_list), np.stack(y_raw_list)
-    )
+    """
+    返回：
+      X_avg: (n_samples, n_features)
+      y_avg: (n_samples,)
+      X_raw: (n_samples, 3, n_features)
+      y_raw: (n_samples, 3)
+    """
+    with open(path, 'r', encoding='utf-8') as f:
+        df = pd.read_json(f, lines=True)
+    # 把 list 转成 np.ndarray 并 stack
+    X_raw = np.stack(df['Features'].map(np.array).to_list())  # (n,3,D)
+    y_raw = np.stack(df['Labels'].map(np.array).to_list())    # (n,3)
+    X_avg = X_raw.mean(axis=1)                                 # (n,D)
+    y_avg = y_raw.mean(axis=1)                                 # (n,)
+    return X_avg, y_avg, X_raw, y_raw
 
 def load_test_data(path):
-    feats = []
-    with open(path, 'r') as f:
-        for line in f:
-            item = json.loads(line)
-            feats.append(np.array(item['Feature'], dtype=np.float32))
-    return np.stack(feats)
+    """返回 X_test: (n_samples, n_features)"""
+    with open(path, 'r', encoding='utf-8') as f:
+        df = pd.read_json(f, lines=True)
+    X_test = np.stack(df['Feature'].map(np.array).to_list())
+    return X_test
 
-def compute_weights_from_raw(X_raw, y_raw, std_thresh=1.0, delta_thresh=2e7):
-    label_stds = np.std(y_raw, axis=1)
-    feature_deltas = np.mean(np.max(X_raw, axis=1) - np.min(X_raw, axis=1), axis=1)
-    w = np.ones_like(label_stds, dtype=np.float32)
-    for i in range(len(w)):
-        if label_stds[i] >= std_thresh and feature_deltas[i] >= delta_thresh:
-            w[i] = 0.3
-        elif label_stds[i] >= std_thresh or feature_deltas[i] >= delta_thresh:
-            w[i] = 0.6
-    return w
-
-def compute_sparse_mask(X, thresh=0.05):
-    nonzero_ratio = (X != 0).mean(axis=0)
-    return nonzero_ratio > thresh
-
-def robust_scaler_fit(X):
-    median = np.median(X, axis=0, keepdims=True)
-    q1 = np.percentile(X, 25, axis=0, keepdims=True)
-    q3 = np.percentile(X, 75, axis=0, keepdims=True)
-    iqr = q3 - q1
-    iqr[iqr < 1e-2] = 1.0
-    return median, iqr
-
-def robust_scaler_transform(X, median, iqr):
-    return (X - median) / iqr
-
-def compute_feature_importances_decision_stump(X, y, n_thresholds=10):
+def compute_sample_weights(y_raw: np.ndarray,
+                           std_thresh: float = 1.0,
+                           delta_thresh: float = 2e7) -> np.ndarray:
     """
-    对每个特征，枚举 n_thresholds 个分割点，计算分割前后 MSE 减少量，作为特征重要性。
-    X: (m, D), y: (m,)
-    返回 importances: (D,)
+    根据三次采样标签的标准差和极差给样本加权：
+      - std 和 delta 都高 → weight=0.3
+      - std 或 delta 高 → weight=0.6
+      - 否则 → weight=1.0
     """
-    m, D = X.shape
-    importances = np.zeros(D, dtype=np.float32)
-    parent_var = np.mean((y - y.mean())**2)
+    std   = y_raw.std(axis=1)
+    delta = y_raw.max(axis=1) - y_raw.min(axis=1)
+    w = np.where((std >= std_thresh) & (delta >= delta_thresh), 0.3,
+         np.where((std >= std_thresh) | (delta >= delta_thresh), 0.6, 1.0))
+    return w.astype(np.float32)
 
-    # 对每个特征
-    for j in range(D):
-        xs = X[:, j]
-        # 生成阈值：该特征的分位数，排除最小值和最大值
-        qs = np.linspace(0, 100, n_thresholds+2)[1:-1]
-        thresholds = np.percentile(xs, qs)
-        best_gain = 0.0
-        # 枚举阈值
-        for t in thresholds:
-            left_mask = xs <= t
-            right_mask = xs > t
-            if left_mask.sum() < 2 or right_mask.sum() < 2:
-                continue
-            y_l, y_r = y[left_mask], y[right_mask]
-            mse_l = np.mean((y_l - y_l.mean())**2)
-            mse_r = np.mean((y_r - y_r.mean())**2)
-            # 加权 MSE
-            wmse = (left_mask.sum()*mse_l + right_mask.sum()*mse_r) / m
-            gain = parent_var - wmse
-            if gain > best_gain:
-                best_gain = gain
-        importances[j] = best_gain
-    return importances
+class Preprocessor:
+    """
+    - 稀疏特征剔除（zero_ratio > 1 - sparse_thresh）
+    - 低方差特征剔除（VarianceThreshold）
+    - log1p 变换 + RobustScaler
+    """
+    def __init__(self, sparse_thresh: float = 0.05, var_thresh: float = 1e-6):
+        self.sparse_thresh = sparse_thresh
+        self.var_thresh    = var_thresh
+        self.scaler        = RobustScaler()
+        self.mask_sparse   = None
+        self.mask_var      = None
+
+    def fit_transform(self, X: np.ndarray) -> np.ndarray:
+        # 1. 稀疏筛选
+        nonzero_ratio = (X != 0).mean(axis=0)
+        mask1 = nonzero_ratio > self.sparse_thresh
+        X1 = X[:, mask1]
+
+        # 2. 低方差剔除
+        vt = VarianceThreshold(threshold=self.var_thresh)
+        X2 = vt.fit_transform(X1)
+
+        # 3. log + RobustScaler
+        X_log    = np.log1p(X2)
+        X_scaled = self.scaler.fit_transform(X_log)
+
+        # 保存 mask
+        self.mask_sparse = mask1
+        self.mask_var    = vt.get_support()
+        return X_scaled
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        X1     = X[:, self.mask_sparse]
+        X2     = X1[:, self.mask_var]
+        X_log  = np.log1p(X2)
+        return self.scaler.transform(X_log)
